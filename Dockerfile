@@ -1,4 +1,4 @@
-FROM ubuntu:24.04
+FROM ubuntu:22.04
 
 # Install wgrib2 from Ubuntu universe (prebuilt binary, ~30s install)
 # Plus Node.js 20.x from NodeSource for the Express server.
