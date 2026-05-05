@@ -1,14 +1,22 @@
-FROM node:20-bookworm-slim
+FROM ubuntu:24.04
 
-# Install wgrib2 from Debian's contrib repo (prebuilt, no compilation)
-RUN echo "deb http://deb.debian.org/debian bookworm main contrib non-free" > /etc/apt/sources.list.d/contrib.list \
- && apt-get update \
+# Install wgrib2 from Ubuntu universe (prebuilt binary, ~30s install)
+# Plus Node.js 20.x from NodeSource for the Express server.
+RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       ca-certificates \
       curl \
-      wgrib2 \
+      gnupg \
+      software-properties-common \
+ && add-apt-repository universe \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends wgrib2 \
+ && curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+ && apt-get install -y --no-install-recommends nodejs \
  && rm -rf /var/lib/apt/lists/* \
- && wgrib2 -version || true
+ # Hard-fail the build if wgrib2 isn't actually on PATH:
+ && which wgrib2 \
+ && wgrib2 -version
 
 WORKDIR /app
 
@@ -21,4 +29,3 @@ ENV PORT=10000
 EXPOSE 10000
 
 CMD ["node", "server.js"]
-
