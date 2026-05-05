@@ -106,33 +106,51 @@ async function findLatestRun() {
  * Download just the TMP:2m record from a forecast-hour GRIB2 file using its .idx.
  * Returns a Buffer of GRIB2 bytes, or null if the record isn't available.
  */
-async function fetchTmp2mRecord(day, hh, fhr) {
+async function fetchTmp2mRecord(day, hh, fhr, debug) {
   const baseUrl = `${S3_BASE}/${rrfsKey(day, hh, fhr)}`;
   const idxUrl = `${baseUrl}.idx`;
   // Step 1: parse the .idx to find the byte offset of TMP:2 m above ground.
-  // .idx format: `record:offset:date:variable:level:fcst:other`
+  // .idx format (wgrib2 style): `record:offset:d=YYYYMMDDHH:variable:level:fcst:other`
+  // Some NCEP products use slightly different level labels. We accept any of:
+  //   "2 m above ground", "2 m AGL", "2 m above gnd"
   let idxText;
   try {
     const r = await fetch(idxUrl, { headers: { "User-Agent": USER_AGENT } });
-    if (!r.ok) return null;
+    if (!r.ok) {
+      if (debug) debug.idxStatus = r.status;
+      return null;
+    }
     idxText = await r.text();
-  } catch {
+  } catch (e) {
+    if (debug) debug.idxError = String(e?.message || e);
     return null;
   }
-  const lines = idxText.split("\n");
+  if (debug) debug.idxBytes = idxText.length;
+  const lines = idxText.split("\n").filter(Boolean);
   let recOffset = null;
   let recEnd = null;
+  let matchedLine = null;
+  const wantLevel = /^2\s*m\s+(above\s+(ground|gnd)|agl)$/i;
   for (let i = 0; i < lines.length; i++) {
     const cols = lines[i].split(":");
     if (cols.length < 5) continue;
     const variable = cols[3];
     const level = cols[4];
-    if (variable === "TMP" && level === "2 m above ground") {
+    if (variable === "TMP" && wantLevel.test(level)) {
       recOffset = Number(cols[1]);
+      matchedLine = lines[i];
       const next = lines[i + 1]?.split(":");
       recEnd = next && next.length >= 2 ? Number(next[1]) - 1 : null;
       break;
     }
+  }
+  if (debug) {
+    debug.matched = matchedLine;
+    debug.tmpLevels = lines
+      .map((l) => l.split(":"))
+      .filter((c) => c.length >= 5 && c[3] === "TMP")
+      .map((c) => c[4])
+      .slice(0, 8);
   }
   if (recOffset == null) return null;
   // Step 2: byte-range download just that record.
@@ -140,8 +158,16 @@ async function fetchTmp2mRecord(day, hh, fhr) {
   const grib = await fetch(baseUrl, {
     headers: { "User-Agent": USER_AGENT, Range: rangeHeader },
   });
+  if (debug) {
+    debug.rangeHeader = rangeHeader;
+    debug.gribStatus = grib.status;
+  }
   if (!grib.ok && grib.status !== 206) return null;
   const buf = Buffer.from(await grib.arrayBuffer());
+  if (debug) {
+    debug.gribBytes = buf.length;
+    debug.gribMagic = buf.slice(0, 4).toString("ascii"); // expect "GRIB"
+  }
   return buf;
 }
 
@@ -149,44 +175,42 @@ async function fetchTmp2mRecord(day, hh, fhr) {
  * Run wgrib2 on a GRIB2 buffer to interpolate temperature at lat/lon.
  * Returns Celsius, or null on error.
  */
-async function wgrib2PointTemp(gribBuf, lat, lon) {
+async function wgrib2PointTemp(gribBuf, lat, lon, debug) {
   const dir = await mkdtemp(join(tmpdir(), "rrfs-"));
   const gribPath = join(dir, "rec.grib2");
   const csvPath = join(dir, "out.csv");
   try {
     await writeFile(gribPath, gribBuf);
-    // wgrib2 expects lon in 0..360 form for some grids; conventional negative
-    // lon (e.g. -74.01) also works for CONUS Lambert. We pass as-is.
-    // Output: bilinear point interpolation, CSV format.
-    //   wgrib2 rec.grib2 -lon LON LAT -csv out.csv
-    // CSV columns: "ref_date","valid_date","var","level","lon","lat","value"
+    let stderrAll = "";
     await new Promise((resolve, reject) => {
       const proc = spawn("wgrib2", [
         gribPath,
         "-lon", String(lon), String(lat),
         "-csv", csvPath,
-      ], { stdio: ["ignore", "ignore", "pipe"] });
-      let stderr = "";
-      proc.stderr.on("data", (d) => { stderr += d.toString(); });
+      ], { stdio: ["ignore", "pipe", "pipe"] });
+      proc.stdout.on("data", (d) => { stderrAll += d.toString(); });
+      proc.stderr.on("data", (d) => { stderrAll += d.toString(); });
       proc.on("error", reject);
       proc.on("close", (code) => {
+        if (debug) debug.wgrib2Exit = code;
         if (code === 0) resolve();
-        else reject(new Error(`wgrib2 exit ${code}: ${stderr.slice(0, 200)}`));
+        else reject(new Error(`wgrib2 exit ${code}: ${stderrAll.slice(0, 400)}`));
       });
     });
-    const csv = await readFile(csvPath, "utf8");
-    // Take the LAST non-empty CSV row (wgrib2 emits one per record).
+    if (debug) debug.wgrib2Out = stderrAll.slice(0, 400);
+    const csv = await readFile(csvPath, "utf8").catch(() => "");
+    if (debug) debug.csvSample = csv.slice(0, 400);
     const rows = csv.trim().split("\n").filter(Boolean);
     if (rows.length === 0) return null;
     const last = rows[rows.length - 1];
     const cols = last.split(",").map((c) => c.replace(/^"|"$/g, ""));
     const valK = Number(cols[cols.length - 1]);
     if (!Number.isFinite(valK)) return null;
-    // RRFS TMP is in Kelvin → °C.
     const valC = valK > 100 ? valK - 273.15 : valK;
     if (valC < -60 || valC > 60) return null;
     return +valC.toFixed(2);
   } catch (e) {
+    if (debug) debug.wgrib2Error = String(e?.message || e).slice(0, 400);
     console.warn(`[wgrib2] ${e.message}`);
     return null;
   } finally {
@@ -255,6 +279,22 @@ app.get("/rrfs", async (req, res) => {
     misses,
     hourly: { time, temperature_2m },
   });
+});
+
+// Diagnostic: GET /debug?lat=40.71&lon=-74.01&fhr=1
+// Returns a verbose trace of one extraction: idx URL, matched line, byte
+// range, GRIB magic bytes, wgrib2 stderr, CSV sample, parsed value.
+app.get("/debug", async (req, res) => {
+  const lat = Number(req.query.lat ?? 40.71);
+  const lon = Number(req.query.lon ?? -74.01);
+  const fhr = Number(req.query.fhr ?? 1);
+  const run = await findLatestRun();
+  if (!run) return res.status(503).json({ error: "no run" });
+  const debug = { run: run.runIso, fhr, idxUrl: `${S3_BASE}/${rrfsKey(run.day, run.hh, fhr)}.idx` };
+  const grib = await fetchTmp2mRecord(run.day, run.hh, fhr, debug);
+  let valC = null;
+  if (grib) valC = await wgrib2PointTemp(grib, lat, lon, debug);
+  res.json({ ...debug, valC });
 });
 
 app.listen(PORT, () => {
